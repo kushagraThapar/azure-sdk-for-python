@@ -1,5 +1,10 @@
 ## Release History
 
+### 4.16.1 (Unreleased)
+
+#### Bugs Fixed
+* Fixed a bug in both sync and async paths where the `/pkranges` change-feed refresh consumed only the first response batch (service-capped at ~8K ranges), leaving the routing-map cache incomplete on large containers and stale after many splits on long-running clients. The continuation `ETag` is now propagated as `If-None-Match` on each subsequent request until the service signals no further changes (304, empty page, or non-advancing `ETag`), mirroring the .NET, Java, and Go SDK behavior. A 100-page safety bound prevents pathological responses from looping indefinitely.
+
 ### 4.16.0 (2026-05-29)
 
 #### Features Added

@@ -534,9 +534,17 @@ class TestRoutingMapProviderUnit(unittest.TestCase):
         seen_if_none_match = []
 
         def read_pk_ranges_retry_then_success(collection_link, options, response_hook=None, **kwargs):
+            headers_in = kwargs.get('headers', {})
+            if_none_match_in = headers_in.get(http_constants.HttpHeaders.IfNoneMatch)
+            # Drain-loop confirmation page: the client is sending back the
+            # etag we just returned, asking if anything has changed since.
+            # A healthy service returns an empty page here, terminating the
+            # drain naturally.
+            if if_none_match_in == '"etag-inc"':
+                return iter([])
+
             call_count['n'] += 1
-            headers = kwargs.get('headers', {})
-            seen_if_none_match.append(headers.get(http_constants.HttpHeaders.IfNoneMatch))
+            seen_if_none_match.append(if_none_match_in)
 
             if response_hook:
                 response_hook({http_constants.HttpHeaders.ETag: '"etag-inc"'}, None)
@@ -826,13 +834,23 @@ class TestRoutingMapProviderUnit(unittest.TestCase):
 
         responses = [bad_payload, good_payload]
         call_count = {'n': 0}
+        last_returned_etag = {'v': None}
 
         client = MagicMock()
 
         def fake_read_pk_ranges(collection_link, options, response_hook=None, **kwargs):
+            if_none_match_in = kwargs.get('headers', {}).get(http_constants.HttpHeaders.IfNoneMatch)
+            # Drain-loop confirmation page: the client is sending back the
+            # etag we just returned. Mirror a healthy service and return an
+            # empty page so the drain terminates instead of looping with
+            # ever-advancing synthetic etags.
+            if if_none_match_in is not None and if_none_match_in == last_returned_etag['v']:
+                return iter([])
             payload = responses[call_count['n']] if call_count['n'] < len(responses) else good_payload
             call_count['n'] += 1
-            headers = {http_constants.HttpHeaders.ETag: '"etag-{}"'.format(call_count['n'])}
+            etag = '"etag-{}"'.format(call_count['n'])
+            last_returned_etag['v'] = etag
+            headers = {http_constants.HttpHeaders.ETag: etag}
             if response_hook:
                 response_hook(headers, None)
             capture_headers = kwargs.get('_internal_response_headers_capture')
@@ -872,6 +890,10 @@ class TestRoutingMapProviderUnit(unittest.TestCase):
         client = MagicMock()
 
         def fake_read_pk_ranges(collection_link, options, response_hook=None, **kwargs):
+            if_none_match_in = kwargs.get('headers', {}).get(http_constants.HttpHeaders.IfNoneMatch)
+            # Drain confirmation page -- nothing more to send.
+            if if_none_match_in == '"etag-bad"':
+                return iter([])
             call_count['n'] += 1
             headers = {http_constants.HttpHeaders.ETag: '"etag-bad"'}
             if response_hook:
@@ -920,13 +942,20 @@ class TestRoutingMapProviderUnit(unittest.TestCase):
 
         responses = [bad_payload, good_payload]
         call_count = {'n': 0}
+        last_returned_etag = {'v': None}
 
         client = MagicMock()
 
         def fake_read_pk_ranges(collection_link, options, response_hook=None, **kwargs):
+            if_none_match_in = kwargs.get('headers', {}).get(http_constants.HttpHeaders.IfNoneMatch)
+            # Drain-loop confirmation page -- empty so drain terminates.
+            if if_none_match_in is not None and if_none_match_in == last_returned_etag['v']:
+                return iter([])
             payload = responses[call_count['n']] if call_count['n'] < len(responses) else good_payload
             call_count['n'] += 1
-            headers = {http_constants.HttpHeaders.ETag: '"etag-{}"'.format(call_count['n'])}
+            etag = '"etag-{}"'.format(call_count['n'])
+            last_returned_etag['v'] = etag
+            headers = {http_constants.HttpHeaders.ETag: etag}
             if response_hook:
                 response_hook(headers, None)
             capture_headers = kwargs.get('_internal_response_headers_capture')
@@ -959,6 +988,10 @@ class TestRoutingMapProviderUnit(unittest.TestCase):
         client = MagicMock()
 
         def fake_read_pk_ranges(collection_link, options, response_hook=None, **kwargs):
+            if_none_match_in = kwargs.get('headers', {}).get(http_constants.HttpHeaders.IfNoneMatch)
+            # Drain confirmation page -- nothing more to send.
+            if if_none_match_in == '"etag-bad"':
+                return iter([])
             call_count['n'] += 1
             headers = {http_constants.HttpHeaders.ETag: '"etag-bad"'}
             if response_hook:
@@ -1039,13 +1072,20 @@ class TestRoutingMapProviderUnit(unittest.TestCase):
 
         responses = [overlap_payload, gap_payload, overlap_payload]
         call_count = {'n': 0}
+        last_returned_etag = {'v': None}
 
         client = MagicMock()
 
         def fake_read_pk_ranges(collection_link, options, response_hook=None, **kwargs):
+            if_none_match_in = kwargs.get('headers', {}).get(http_constants.HttpHeaders.IfNoneMatch)
+            # Drain confirmation page -- empty so drain terminates.
+            if if_none_match_in is not None and if_none_match_in == last_returned_etag['v']:
+                return iter([])
             payload = responses[call_count['n']] if call_count['n'] < len(responses) else overlap_payload
             call_count['n'] += 1
-            headers = {http_constants.HttpHeaders.ETag: '"etag-mixed-{}"'.format(call_count['n'])}
+            etag = '"etag-mixed-{}"'.format(call_count['n'])
+            last_returned_etag['v'] = etag
+            headers = {http_constants.HttpHeaders.ETag: etag}
             if response_hook:
                 response_hook(headers, None)
             capture_headers = kwargs.get('_internal_response_headers_capture')
@@ -1125,6 +1165,132 @@ class TestRoutingMapProviderUnit(unittest.TestCase):
             cache._collection_routing_map_by_item["dbs/db1/colls/coll1"].change_feed_etag,
             '"etag-cached"',
             "Cached ETag must remain the pre-503 value (no partial overwrite)."
+        )
+
+    # ==========================================================================
+    # /pkranges change-feed drain-loop tests.
+    #
+    # On large containers (and on long-running clients that miss many splits)
+    # the service caps each /pkranges change-feed response at ~8K ranges and
+    # signals "more pages available" via an updated ETag. The fetch path must
+    # drain the change feed by advancing ``If-None-Match`` until the service
+    # returns an empty page / a non-advancing ETag / 304. A single-call fetch
+    # would leave the routing-map cache incomplete.
+    # ==========================================================================
+
+    def test_fetch_routing_map_drains_change_feed_across_multiple_pages(self):
+        """A multi-page /pkranges change-feed response must be drained
+        completely, with ``If-None-Match`` advancing on each page until the
+        service signals "no more changes" with an empty response."""
+        # Three pages of ranges. The drain should issue exactly four calls:
+        # one per page plus the final "anything else?" confirmation.
+        pages = [
+            (None,        '"etag-1"', [
+                {'id': '0', 'minInclusive': '',   'maxExclusive': '40'},
+            ]),
+            ('"etag-1"', '"etag-2"', [
+                {'id': '1', 'minInclusive': '40', 'maxExclusive': '80'},
+            ]),
+            ('"etag-2"', '"etag-3"', [
+                {'id': '2', 'minInclusive': '80', 'maxExclusive': 'FF'},
+            ]),
+        ]
+        seen_if_none_match = []
+
+        client = MagicMock()
+
+        def fake_read_pk_ranges(collection_link, options, response_hook=None, **kwargs):
+            if_none_match_in = kwargs.get('headers', {}).get(http_constants.HttpHeaders.IfNoneMatch)
+            seen_if_none_match.append(if_none_match_in)
+            for expected_in, etag_out, payload in pages:
+                if expected_in == if_none_match_in:
+                    headers = {http_constants.HttpHeaders.ETag: etag_out}
+                    if response_hook:
+                        response_hook(headers, None)
+                    capture_headers = kwargs.get('_internal_response_headers_capture')
+                    if capture_headers is not None:
+                        capture_headers.update(headers)
+                    return iter(payload)
+            # No more changes after the last page's ETag -- mirror the service:
+            # echo the request ETag, return an empty page.
+            headers = {http_constants.HttpHeaders.ETag: if_none_match_in}
+            if response_hook:
+                response_hook(headers, None)
+            capture_headers = kwargs.get('_internal_response_headers_capture')
+            if capture_headers is not None:
+                capture_headers.update(headers)
+            return iter([])
+
+        client._ReadPartitionKeyRanges = MagicMock(side_effect=fake_read_pk_ranges)
+        cache = PartitionKeyRangeCache(client)
+
+        result = cache.get_routing_map("dbs/db1/colls/coll1", feed_options={})
+
+        self.assertIsNotNone(result)
+        ids = [r['id'] for r in result._orderedPartitionKeyRanges]
+        self.assertEqual(
+            ids, ['0', '1', '2'],
+            "All ranges across every drained page must populate the routing map."
+        )
+        self.assertEqual(
+            seen_if_none_match, [None, '"etag-1"', '"etag-2"', '"etag-3"'],
+            "If-None-Match must advance to the previous page's ETag on each "
+            "subsequent drain request."
+        )
+        self.assertEqual(
+            result.change_feed_etag, '"etag-3"',
+            "The final cached ETag must be the last advancing ETag returned by "
+            "the service so the next refresh resumes from the right point."
+        )
+
+    def test_fetch_routing_map_drain_terminates_at_safety_bound(self):
+        """A pathological service that returns a new ETag on every page must
+        not let the drain loop forever -- the safety bound caps it at ~100
+        pages and logs a warning so the fetch still completes."""
+        client = MagicMock()
+        call_count = {'n': 0}
+
+        def fake_read_pk_ranges(collection_link, options, response_hook=None, **kwargs):
+            call_count['n'] += 1
+            headers = {http_constants.HttpHeaders.ETag: '"etag-{}"'.format(call_count['n'])}
+            if response_hook:
+                response_hook(headers, None)
+            capture_headers = kwargs.get('_internal_response_headers_capture')
+            if capture_headers is not None:
+                capture_headers.update(headers)
+            # Always return a fresh single range so the drain sees "more work
+            # available" indefinitely.
+            return iter([
+                {
+                    'id': 'r-{}'.format(call_count['n']),
+                    'minInclusive': '', 'maxExclusive': 'FF',
+                }
+            ])
+
+        client._ReadPartitionKeyRanges = MagicMock(side_effect=fake_read_pk_ranges)
+        cache = PartitionKeyRangeCache(client)
+
+        with self.assertLogs(
+            'azure.cosmos._routing.routing_map_provider', level='WARNING'
+        ) as cm:
+            # We don't care whether the synthetic ranges form a valid routing
+            # map -- only that the drain terminates instead of hanging.
+            try:
+                cache.get_routing_map("dbs/db1/colls/coll1", feed_options={})
+            except Exception:  # pylint: disable=broad-except
+                pass
+
+        # First outer attempt must have hit the 100-page safety bound. Outer
+        # retry loop may issue further attempts before giving up, so just
+        # assert call_count is at least 100 and the warning was logged.
+        self.assertGreaterEqual(
+            call_count['n'], 100,
+            "Drain loop must reach the safety bound (~100 pages) before "
+            "process_fetched_ranges is invoked."
+        )
+        self.assertTrue(
+            any('safety bound' in msg for msg in cm.output),
+            "A warning about hitting the drain safety bound must be logged."
         )
 
 
